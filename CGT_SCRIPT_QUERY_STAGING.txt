@@ -1,0 +1,908 @@
+------------------ FIRST QUERY ------------------------------------
+
+SELECT
+    t.participant_id_fk,
+    d.trns_dtl_id_pk,
+    d.trns_type,
+    t.transaction_date,
+    d.quantity,
+    d.rate,
+    SUM(
+        CASE 
+           WHEN d.trns_type = 'S' THEN d.quantity
+           WHEN d.trns_type = 'R' THEN -d.quantity
+        END
+    ) OVER (
+        PARTITION BY t.participant_id_fk
+        ORDER BY t.transaction_date, d.trns_dtl_id_pk
+    ) running_units
+FROM units_transaction t
+JOIN units_transaction_dtl d
+ON t.transaction_id_pk = d.transaction_id_fk
+WHERE t.participant_id_fk = :P_PARTICIPANT
+AND d.trns_type IN ('I','R')
+ORDER BY t.transaction_date;
+
+------------------ SECOND QUERY ------------------------------------
+
+SELECT
+    t.participant_id_fk,
+    --d.trns_dtl_id_pk,
+    d.trns_type,
+    t.transaction_date,
+    d.nav_date,
+    d.quantity,
+    d.rate,
+    d.invest_amount,
+
+    /* Running unit balance */
+    SUM(
+        CASE
+            WHEN d.trns_type = 'I' THEN d.quantity
+            WHEN d.trns_type = 'R' THEN -d.quantity
+        END
+    ) OVER (
+        PARTITION BY t.participant_id_fk
+        ORDER BY d.nav_date, d.trns_dtl_id_pk
+    ) running_units,
+
+    /* Previous NAV rate (Investment rate) */
+    LAG(
+        CASE 
+            WHEN d.trns_type = 'I' THEN d.rate
+        END
+    ) IGNORE NULLS OVER (
+        PARTITION BY t.participant_id_fk
+        ORDER BY d.nav_date, d.trns_dtl_id_pk
+    ) previous_sale_nav,
+
+    /* NAV rate difference only for Redemption */
+    CASE
+        WHEN d.trns_type = 'R' THEN
+             d.rate -
+             LAG(
+                 CASE WHEN d.trns_type = 'I' THEN d.rate END
+             ) IGNORE NULLS OVER (
+                 PARTITION BY t.participant_id_fk
+                 ORDER BY d.nav_date, d.trns_dtl_id_pk
+             )
+    END AS nav_rate_difference,
+
+    /* CGT unit calculation */
+    CASE
+        WHEN d.trns_type = 'R' THEN
+             d.invest_amount *
+             (
+               d.rate -
+               LAG(
+                   CASE WHEN d.trns_type = 'I' THEN d.rate END
+               ) IGNORE NULLS OVER (
+                   PARTITION BY t.participant_id_fk
+                   ORDER BY d.nav_date, d.trns_dtl_id_pk
+               )
+             )
+    END AS cgt_amount
+
+FROM units_transaction t
+JOIN units_transaction_dtl d
+ON t.transaction_id_pk = d.transaction_id_fk
+
+WHERE t.participant_id_fk = :P_PARTICIPANT
+AND d.trns_type IN ('I','R')
+
+ORDER BY d.nav_date --, d.trns_dtl_id_pk;
+
+------------------ THIRD QUERY ------------------------------------
+
+
+SELECT
+    t.participant_id_fk,
+    d.trns_type,
+    t.transaction_date,
+    d.nav_date,
+    d.quantity,
+    d.rate,
+    d.invest_amount,
+
+    /* Running unit balance */
+    SUM(
+        CASE
+            WHEN d.trns_type = 'I' THEN d.quantity
+            WHEN d.trns_type = 'R' THEN -d.quantity
+        END
+    ) OVER (
+        PARTITION BY t.participant_id_fk
+        ORDER BY d.nav_date, d.trns_dtl_id_pk
+    ) running_units,
+
+    /* Previous NAV rate (Investment rate) */
+    LAG(
+        CASE 
+            WHEN d.trns_type = 'I' THEN d.rate
+        END
+    ) IGNORE NULLS OVER (
+        PARTITION BY t.participant_id_fk
+        ORDER BY d.nav_date, d.trns_dtl_id_pk
+    ) previous_sale_nav,
+
+    /* NAV rate difference only for Redemption */
+    CASE
+        WHEN d.trns_type = 'R' THEN
+             d.rate -
+             LAG(
+                 CASE WHEN d.trns_type = 'I' THEN d.rate END
+             ) IGNORE NULLS OVER (
+                 PARTITION BY t.participant_id_fk
+                 ORDER BY d.nav_date, d.trns_dtl_id_pk
+             )
+    END nav_rate_difference,
+
+    /* CGT calculation */
+    CASE
+        WHEN d.trns_type = 'R' THEN
+             d.invest_amount *
+             (
+               d.rate -
+               LAG(
+                   CASE WHEN d.trns_type = 'I' THEN d.rate END
+               ) IGNORE NULLS OVER (
+                   PARTITION BY t.participant_id_fk
+                   ORDER BY d.nav_date, d.trns_dtl_id_pk
+               )
+             )
+    END cgt_amount,
+
+    /* Cumulative Investment */
+    SUM(
+        CASE WHEN d.trns_type = 'I' THEN d.quantity END
+    ) OVER (
+        PARTITION BY t.participant_id_fk
+        ORDER BY d.nav_date, d.trns_dtl_id_pk
+    ) cum_invest,
+
+    /* Cumulative Redemption */
+    SUM(
+        CASE WHEN d.trns_type = 'R' THEN d.quantity END
+    ) OVER (
+        PARTITION BY t.participant_id_fk
+        ORDER BY d.nav_date, d.trns_dtl_id_pk
+    ) cum_redeem,
+
+    /* FIFO Remaining Investment Units */
+    CASE
+        WHEN d.trns_type = 'I' THEN
+             GREATEST(
+                 0,
+                 d.quantity -
+                 GREATEST(
+                     0,
+                     NVL(
+                         SUM(
+                             CASE WHEN d.trns_type = 'R' THEN d.quantity END
+                         ) OVER (
+                             PARTITION BY t.participant_id_fk
+                             ORDER BY d.nav_date, d.trns_dtl_id_pk
+                         ),0
+                     )
+                     -
+                     (
+                         SUM(
+                             CASE WHEN d.trns_type = 'I' THEN d.quantity END
+                         ) OVER (
+                             PARTITION BY t.participant_id_fk
+                             ORDER BY d.nav_date, d.trns_dtl_id_pk
+                         ) - d.quantity
+                     )
+                 )
+             )
+    END AS R_CGT_QTY
+
+FROM units_transaction t
+JOIN units_transaction_dtl d
+ON t.transaction_id_pk = d.transaction_id_fk
+
+WHERE t.participant_id_fk = :P_PARTICIPANT
+AND d.trns_type IN ('I','R')
+
+ORDER BY d.nav_date, d.trns_dtl_id_pk;
+
+
+----------------------------------- FOURTH QUERY -------------------------------------------------------
+
+    WITH base AS
+(
+SELECT
+    t.participant_id_fk,
+    d.trns_dtl_id_pk,
+    d.trns_type,
+    d.nav_date,
+    d.quantity,
+    D.RATE,
+    D.GROSS_AMOUNT,
+    SUM(CASE WHEN d.trns_type='I' THEN d.quantity END)
+    OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_invest,
+
+    SUM(CASE WHEN d.trns_type='R' THEN d.quantity END)
+    OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_redeem
+
+FROM units_transaction t
+JOIN units_transaction_dtl d
+ON t.transaction_id_pk=d.transaction_id_fk
+
+WHERE t.participant_id_fk=:P_PARTICIPANT
+AND d.trns_type IN ('I','R')
+--and d.trns_dtl_id_pk in (1,2,3,4)
+),
+
+total_r AS
+(
+SELECT MAX(cum_redeem) total_redeem FROM base
+)
+
+SELECT
+    b.trns_type,
+    b.quantity,
+    B.RATE,
+    B.GROSS_AMOUNT,
+    b.cum_invest,
+    b.cum_redeem,
+    b.cum_invest - b.cum_redeem running_units,
+
+    CASE
+      WHEN b.trns_type='I' THEN
+           LEAST(
+                b.quantity,
+                GREATEST(
+                        0,
+                        tr.total_redeem - (b.cum_invest - b.quantity)
+                )
+           )
+      ELSE 0
+    END r_cgt_qty
+
+FROM base b
+CROSS JOIN total_r tr
+ORDER BY b.nav_date,b.trns_dtl_id_pk;
+
+
+--------------------- FIFTH QUERY -------------------------------
+
+WITH base AS
+(
+SELECT
+    t.participant_id_fk,
+    d.trns_dtl_id_pk,
+    d.trns_type,
+    d.nav_date,
+    d.quantity,
+    d.rate,
+    d.gross_amount,
+
+    SUM(CASE WHEN d.trns_type='I' THEN d.quantity ELSE 0 END)
+    OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_invest,
+
+    SUM(CASE WHEN d.trns_type='R' THEN d.quantity ELSE 0 END)
+    OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_redeem
+
+FROM units_transaction t
+JOIN units_transaction_dtl d
+ON t.transaction_id_pk=d.transaction_id_fk
+
+WHERE t.participant_id_fk=:P_PARTICIPANT
+AND d.trns_type IN ('I','R')
+and d.trns_dtl_id_pk in (1,2,3,4)
+),
+
+total_r AS
+(
+SELECT MAX(cum_redeem) total_redeem FROM base
+)
+
+SELECT
+    b.trns_type,
+    b.quantity,
+    b.rate,
+    b.gross_amount,
+    b.cum_invest,
+    b.cum_redeem,
+
+    /* running balance starting from first row */
+    (b.cum_invest - b.cum_redeem) running_units,
+
+    /* consumed units via FIFO */
+    CASE
+      WHEN b.trns_type='I' THEN
+           LEAST(
+                b.quantity,
+                GREATEST(
+                        0,
+                        tr.total_redeem - (b.cum_invest - b.quantity)
+                )
+           )
+      ELSE 0
+    END r_cgt_qty,
+
+    /* remaining investment units */
+    CASE
+      WHEN b.trns_type='I' THEN
+           b.quantity -
+           LEAST(
+                b.quantity,
+                GREATEST(
+                        0,
+                        tr.total_redeem - (b.cum_invest - b.quantity)
+                )
+           )
+      ELSE 0
+    END remaining_units
+
+FROM base b
+CROSS JOIN total_r tr
+ORDER BY b.nav_date,b.trns_dtl_id_pk;
+
+------------------------------ SIXTH ---------------------------------------------------
+
+WITH ledger AS
+(
+SELECT
+    t.participant_id_fk,
+    d.trns_dtl_id_pk,
+    d.trns_type,
+    d.nav_date,
+    d.quantity,
+    d.rate,
+    d.gross_amount,
+
+    /* cumulative investment */
+    SUM(CASE WHEN d.trns_type='I' THEN d.quantity ELSE 0 END)
+    OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_invest,
+
+    /* cumulative redemption */
+    SUM(CASE WHEN d.trns_type='R' THEN d.quantity ELSE 0 END)
+    OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_redeem
+
+FROM units_transaction t
+JOIN units_transaction_dtl d
+ON t.transaction_id_pk = d.transaction_id_fk
+
+WHERE t.participant_id_fk = :P_PARTICIPANT
+AND d.trns_type IN ('I','R')
+)
+
+SELECT
+    trns_type,
+    quantity,
+    rate,
+    gross_amount,
+    cum_invest,
+    cum_redeem,
+    cum_invest - cum_redeem running_units
+FROM ledger
+ORDER BY nav_date,trns_dtl_id_pk;
+
+
+----------------------------- SEVENTH -------------------------------------------------
+
+WITH trx AS
+(
+SELECT
+    t.participant_id_fk,
+    d.trns_dtl_id_pk,
+    d.trns_type,
+    d.nav_date,
+    d.quantity,
+    d.rate,
+    d.gross_amount,
+
+    /* cumulative investment */
+    SUM(CASE WHEN d.trns_type='I' THEN d.quantity ELSE 0 END)
+        OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_invest,
+
+    /* cumulative redemption */
+    SUM(CASE WHEN d.trns_type='R' THEN d.quantity ELSE 0 END)
+        OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_redeem
+
+FROM units_transaction t
+JOIN units_transaction_dtl d
+ON t.transaction_id_pk=d.transaction_id_fk
+
+WHERE t.participant_id_fk=:P_PARTICIPANT
+AND d.trns_type IN ('I','R')
+),
+
+/* investment lots */
+invest AS
+(
+SELECT
+    trns_dtl_id_pk invest_id,
+    nav_date invest_date,
+    quantity invest_qty,
+    rate invest_nav,
+
+    cum_invest - quantity inv_start,
+    cum_invest inv_end
+
+FROM trx
+WHERE trns_type='I'
+),
+
+/* redemption lots */
+redeem AS
+(
+SELECT
+    trns_dtl_id_pk redeem_id,
+    nav_date redeem_date,
+    quantity redeem_qty,
+    rate redeem_nav,
+
+    cum_redeem - quantity red_start,
+    cum_redeem red_end
+
+FROM trx
+WHERE trns_type='R'
+)
+
+/* FIFO matching */
+SELECT
+    i.invest_id,
+    r.redeem_id,
+
+    i.invest_date,
+    r.redeem_date,
+
+    i.invest_nav,
+    r.redeem_nav,
+
+    /* quantity consumed */
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) qty_difference,
+
+    /* nav difference */
+    r.redeem_nav - i.invest_nav nav_difference,
+
+    /* CGT amount */
+    (r.redeem_nav - i.invest_nav) *
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) cgt_amount
+
+FROM invest i
+JOIN redeem r
+ON r.red_end > i.inv_start
+AND r.red_start < i.inv_end
+
+ORDER BY i.invest_date , r.redeem_date;
+
+---------------------- EIGHT -----------------------------------------------
+
+WITH trx AS
+(
+SELECT
+    t.participant_id_fk,
+    d.trns_dtl_id_pk,
+    d.trns_type,
+    d.nav_date,
+    d.quantity,
+    d.rate,
+    d.gross_amount,
+
+    /* cumulative investment */
+    SUM(CASE WHEN d.trns_type='I' THEN d.quantity ELSE 0 END)
+        OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_invest,
+
+    /* cumulative redemption */
+    SUM(CASE WHEN d.trns_type='R' THEN d.quantity ELSE 0 END)
+        OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_redeem
+
+FROM units_transaction t
+JOIN units_transaction_dtl d
+ON t.transaction_id_pk=d.transaction_id_fk
+
+WHERE t.participant_id_fk=:P_PARTICIPANT
+AND d.trns_type IN ('I','R')
+),
+
+/* investment lots */
+invest AS
+(
+SELECT
+    trns_dtl_id_pk invest_id,
+    nav_date invest_date,
+    quantity invest_qty,
+    rate invest_nav,
+
+    cum_invest - quantity inv_start,
+    cum_invest inv_end
+
+FROM trx
+WHERE trns_type='I'
+),
+
+/* redemption lots */
+redeem AS
+(
+SELECT
+    trns_dtl_id_pk redeem_id,
+    nav_date redeem_date,
+    quantity redeem_qty,
+    rate redeem_nav,
+
+    cum_redeem - quantity red_start,
+    cum_redeem red_end
+
+FROM trx
+WHERE trns_type='R'
+)
+
+/* FIFO matching */
+SELECT
+    i.invest_id,
+    r.redeem_id,
+
+    i.invest_date,
+    r.redeem_date,
+
+    i.invest_nav,
+    r.redeem_nav,
+
+    /* quantity consumed */
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) qty_difference,
+
+    /* nav difference */
+    r.redeem_nav - i.invest_nav nav_difference,
+
+    /* CGT amount */
+    (r.redeem_nav - i.invest_nav) *
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) cgt_amount
+
+FROM invest i
+JOIN redeem r
+ON r.red_end > i.inv_start
+AND r.red_start < i.inv_end
+
+ORDER BY i.invest_date , r.redeem_date;
+
+------------------------------------- NINTH ---------------------------------
+
+WITH trx AS
+(
+    SELECT
+        t.participant_id_fk,
+        d.trns_dtl_id_pk,
+        d.trns_type,
+        d.nav_date,
+        d.quantity,
+        d.rate,
+        d.gross_amount,
+
+        SUM(CASE WHEN d.trns_type='I' THEN d.quantity ELSE 0 END)
+            OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_invest,
+
+        SUM(CASE WHEN d.trns_type='R' THEN d.quantity ELSE 0 END)
+            OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_redeem
+
+    FROM units_transaction t
+    JOIN units_transaction_dtl d
+        ON t.transaction_id_pk = d.transaction_id_fk
+
+    WHERE t.participant_id_fk = :P_PARTICIPANT
+    AND d.trns_type IN ('I','R')
+),
+
+invest AS
+(
+    SELECT
+        trns_dtl_id_pk invest_id,
+        nav_date invest_date,
+        quantity invest_qty,
+        rate invest_nav,
+        cum_invest - quantity inv_start,
+        cum_invest inv_end
+    FROM trx
+    WHERE trns_type='I'
+),
+
+redeem AS
+(
+    SELECT
+        trns_dtl_id_pk redeem_id,
+        nav_date redeem_date,
+        quantity redeem_qty,
+        rate redeem_nav,
+        cum_redeem - quantity red_start,
+        cum_redeem red_end
+    FROM trx
+    WHERE trns_type='R'
+)
+
+SELECT
+    i.invest_id,
+    i.invest_qty,
+    r.redeem_id,
+
+    i.invest_date,
+    r.redeem_date,
+
+    i.invest_nav,
+    r.redeem_nav,
+
+    /* FIFO matched quantity */
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) matched_units,
+
+    /* NAV Difference */
+    r.redeem_nav - i.invest_nav nav_difference,
+
+    /* Qty Difference for CGT (Units × NAV difference) */
+    (r.redeem_nav - i.invest_nav) *
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) qty_difference,
+
+    /* CGT Amount (can include tax rate if needed) */
+    ((r.redeem_nav - i.invest_nav) *
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    )) cgt_amount,
+
+    /* Remaining Units after this redemption */
+    i.inv_end - 
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) remaining_units
+
+FROM invest i
+JOIN redeem r
+    ON r.red_end > i.inv_start
+    AND r.red_start < i.inv_end
+
+ORDER BY i.invest_date, r.redeem_date;
+
+----------------------------- THENTH -----------------------------------
+
+WITH trx AS
+(
+    SELECT
+        t.participant_id_fk,
+        d.trns_dtl_id_pk,
+        d.trns_type,
+        d.nav_date,
+        d.quantity,
+        d.rate,
+        d.gross_amount,
+
+        SUM(CASE WHEN d.trns_type='I' THEN d.quantity ELSE 0 END)
+            OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_invest,
+
+        SUM(CASE WHEN d.trns_type='R' THEN d.quantity ELSE 0 END)
+            OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_redeem
+
+    FROM units_transaction t
+    JOIN units_transaction_dtl d
+        ON t.transaction_id_pk = d.transaction_id_fk
+
+    WHERE t.participant_id_fk = :P_PARTICIPANT
+    AND d.trns_type IN ('I','R')
+),
+
+invest AS
+(
+    SELECT
+        trns_dtl_id_pk invest_id,
+        nav_date invest_date,
+        quantity invest_qty,
+        rate invest_nav,
+        cum_invest - quantity inv_start,
+        cum_invest inv_end
+    FROM trx
+    WHERE trns_type='I'
+),
+
+redeem AS
+(
+    SELECT
+        trns_dtl_id_pk redeem_id,
+        nav_date redeem_date,
+        quantity redeem_qty,
+        rate redeem_nav,
+        cum_redeem - quantity red_start,
+        cum_redeem red_end
+    FROM trx
+    WHERE trns_type='R'
+),
+
+fifo_calc AS
+(
+SELECT
+    i.invest_id,
+    r.redeem_id,
+
+    i.invest_date,
+    r.redeem_date,
+
+    i.invest_nav,
+    r.redeem_nav,
+
+    /* FIFO matched quantity */
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) matched_units,
+
+    /* NAV Difference */
+    r.redeem_nav - i.invest_nav nav_difference,
+
+    /* Qty Difference */
+    (r.redeem_nav - i.invest_nav) *
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) qty_difference,
+
+    /* CGT Amount */
+    (r.redeem_nav - i.invest_nav) *
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) cgt_amount,
+
+    /* Remaining units */
+    i.inv_end -
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) remaining_units
+
+FROM invest i
+JOIN redeem r
+    ON r.red_end > i.inv_start
+   AND r.red_start < i.inv_end
+)
+
+SELECT *
+FROM fifo_calc
+WHERE matched_units > 0
+AND remaining_units >= 0
+ORDER BY invest_date, redeem_date;
+
+--------------------------------ELEVENTH------------------------------------------
+
+WITH trx AS
+(
+    SELECT
+        t.participant_id_fk,
+        d.trns_dtl_id_pk,
+        d.trns_type,
+        d.nav_date,
+        d.quantity,
+        d.rate,
+        d.gross_amount,
+
+        SUM(CASE WHEN d.trns_type='I' THEN d.quantity ELSE 0 END)
+            OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_invest,
+
+        SUM(CASE WHEN d.trns_type='R' THEN d.quantity ELSE 0 END)
+            OVER(ORDER BY d.nav_date,d.trns_dtl_id_pk) cum_redeem
+
+    FROM units_transaction t
+    JOIN units_transaction_dtl d
+        ON t.transaction_id_pk = d.transaction_id_fk
+
+    WHERE t.participant_id_fk = :P_PARTICIPANT
+    AND d.trns_type IN ('I','R')
+),
+
+invest AS
+(
+    SELECT
+        trns_dtl_id_pk invest_id,
+        nav_date invest_date,
+        quantity invest_qty,
+        rate invest_nav,
+        cum_invest - quantity inv_start,
+        cum_invest inv_end
+    FROM trx
+    WHERE trns_type='I'
+),
+
+redeem AS
+(
+    SELECT
+        trns_dtl_id_pk redeem_id,
+        nav_date redeem_date,
+        quantity redeem_qty,
+        rate redeem_nav,
+        cum_redeem - quantity red_start,
+        cum_redeem red_end
+    FROM trx
+    WHERE trns_type='R'
+),
+
+fifo_calc AS
+(
+SELECT
+    i.invest_id,
+    r.redeem_id,
+
+    i.invest_date,
+    r.redeem_date,
+
+    i.invest_nav,
+    r.redeem_nav,
+
+    /* FIFO matched quantity */
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) matched_units,
+
+    /* NAV Difference */
+    r.redeem_nav - i.invest_nav nav_difference,
+
+    /* Qty Difference */
+    (r.redeem_nav - i.invest_nav) *
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) qty_difference,
+
+    /* CGT Amount */
+    (r.redeem_nav - i.invest_nav) *
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) cgt_amount,
+
+    /* Remaining units */
+    i.inv_end -
+    GREATEST(
+        0,
+        LEAST(i.inv_end , r.red_end) -
+        GREATEST(i.inv_start , r.red_start)
+    ) remaining_units
+
+FROM invest i
+JOIN redeem r
+    ON r.red_end > i.inv_start
+   AND r.red_start < i.inv_end
+)
+
+SELECT
+    f.*,
+
+    /* Total CGT per Redemption */
+    SUM(cgt_amount) OVER (PARTITION BY redeem_id) total_cgt_per_redeem
+
+FROM fifo_calc f
+WHERE matched_units > 0
+AND remaining_units >= 0
+ORDER BY invest_date, redeem_date;
